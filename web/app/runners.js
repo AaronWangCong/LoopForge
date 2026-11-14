@@ -2,6 +2,8 @@ function openRunModal(workflowId){const select=$('#runWorkflowChoice'),workflows
 
 // ---------- 执行机器（bind-cli，个人维度） ----------
 let runnerRefreshTimer=null;
+/** 当前接入系统默认 macOS / Linux，页面内保留用户的手动选择。 */
+let runnerInstallPlatform='unix';
 async function refreshRunners(silent){
   try{
     await ensureRunnerBindCode(silent);
@@ -12,13 +14,14 @@ async function refreshRunners(silent){
     state.runners=runners||[];
     state.defaultRunnerId=def?.runnerId||'';
     state.cloudPool=def?.cloudPool||null;
+    state.minRunnerVersion=def?.minRunnerVersion||'';
     renderRunnersView();
   }catch(e){if(!silent)toast(e.message)}
 }
-// 接入命令携带一次性绑定码（10 分钟有效）：复制即用，无需先创建个人 Token。
+/** 接入命令携带一次性绑定码（10 分钟有效），临近过期时自动刷新。 */
 async function ensureRunnerBindCode(silent){
   const cached=state.runnerBindCode;
-  if(cached&&new Date(cached.expiresAt).getTime()>Date.now()+60_000)return;
+  if(runnerBindCodeReady(cached,Date.now()+60_000))return;
   try{
     const out=await api('/api/runners/bind-codes',{method:'POST',silent:true,body:'{}'});
     if(out?.code){state.runnerBindCode=out;renderRunnersView()}
@@ -63,6 +66,16 @@ function runnerPersonalCredentialConfigured(provider){
   if(provider==='codebuddy')return !!user.codeBuddyApiKeyConfigured;
   return !!user.agentCliCredentials?.[provider]?.apiKeyConfigured;
 }
+// CodeBuddy on a runner always uses the personal API Key, so the card shows
+// the same network environment as 个人配置 → CodeBuddy. An iOA key used with
+// the wrong environment fails with 401 on the machine.
+function runnerCodeBuddyAuthHTML(credentialReady){
+  if(!credentialReady)return '<span class="runner-auth-fixed missing" title="到个人配置补充 CodeBuddy API Key 并选择网络环境">个人凭证（未配置）</span>';
+  const user=userById(state.currentUser?.id)||{};
+  const raw=String(user.codeBuddyInternetEnvironment||'').trim(),env=codeBuddyEnvironment(raw);
+  if(!env)return `<span class="runner-auth-fixed missing" title="网络环境「${escapeHTML(raw)}」无法识别，CodeBuddy 会按国际站连接。到个人配置重新选择网络环境">个人凭证 · 网络环境无法识别</span>`;
+  return `<span class="runner-auth-fixed" title="CodeBuddy 使用个人配置中保存的 API Key，网络环境：${escapeHTML(env.label)}">个人凭证 · ${escapeHTML(env.label)}</span>`;
+}
 function runnerLastSeen(value){
   if(!value)return '尚无心跳';
   const seconds=Math.max(0,Math.round((Date.now()-new Date(value).getTime())/1000));
@@ -85,26 +98,86 @@ function runnerCopyCommand(btn,text,message){
   if(!navigator.clipboard){toast('复制失败，请手动选择复制');return}
   navigator.clipboard.writeText(text).then(done).catch(()=>toast('复制失败，请手动选择复制'));
 }
+/** 判断绑定码是否仍可使用，避免复制空码或过期接入命令。 */
+function runnerBindCodeReady(binding=state.runnerBindCode,now=Date.now()){
+  return typeof binding?.code==='string'&&!!binding.code.trim()&&new Date(binding.expiresAt).getTime()>now;
+}
+/** 转义 PowerShell 单引号参数，保留地址和绑定码的字面值。 */
+function runnerPowerShellQuote(value){return "'"+String(value).replace(/'/g,"''")+"'"}
+/** 转义 Bash 单引号参数，防止命令替换或元字符执行。 */
+function runnerBashQuote(value){return "'"+String(value).replace(/'/g,"'\\''")+"'"}
+/** 生成 Windows 首次绑定、再次启动或停止命令。 */
+function runnerWindowsCommand(mode='bind'){
+  /** 本平台的安装脚本地址。 */
+  const installerURL=runnerPowerShellQuote(`${location.origin}/runners/install.ps1`);
+  /** 已绑定机器再次启动不提交新绑定码，避免覆盖现有身份。 */
+  const action=mode==='stop'?' -Stop':mode==='restart'?'':` -BindCode ${runnerPowerShellQuote(state.runnerBindCode.code)}`;
+  return "$lfInstaller = Join-Path $env:TEMP ('loopforge-install-' + [guid]::NewGuid().ToString('N') + '.ps1')\n"
+    +`Invoke-WebRequest -UseBasicParsing -Uri ${installerURL} -OutFile $lfInstaller -ErrorAction Stop\n`
+    +`powershell -NoProfile -ExecutionPolicy Bypass -File $lfInstaller -ServerUrl ${runnerPowerShellQuote(location.origin)}${action}`;
+}
+/** 生成 macOS/Linux 命令，沿用已有的协议回退安装方式。 */
+function runnerUnixCommand(uninstall=false){
+  /** HTTPS 优先的 Bash 下载表达式。 */
+  const download=`(curl -fsSL --connect-timeout 5 ${runnerBashQuote(`https://${location.host}/runners/install.sh`)} || curl -fsSL ${runnerBashQuote(`http://${location.host}/runners/install.sh`)})`;
+  return uninstall?`${download} | bash -s -- --uninstall`:`${download} | bash -s -- --server ${runnerBashQuote(location.host)} --token ${runnerBashQuote(state.runnerBindCode.code)} --service`;
+}
+/** 同步系统标签的选中语义，并复用 SlidingTabs 的指示层与键盘切换。 */
+function renderRunnerInstallTabs(){
+  /** 接入系统标签组。 */
+  const platformTabs=$('#runnerInstallPlatform');
+  if(!platformTabs)return;
+  platformTabs.querySelectorAll('[data-runner-platform]').forEach(tab=>{
+    /** 标签是否对应当前接入系统。 */
+    const selected=tab.dataset.runnerPlatform===runnerInstallPlatform;
+    tab.setAttribute('aria-selected',String(selected));
+    tab.tabIndex=selected?0:-1;
+    if(selected)$('#runnerInstallPanel')?.setAttribute('aria-labelledby',tab.id);
+    tab.onclick=()=>{runnerInstallPlatform=tab.dataset.runnerPlatform;renderRunnerInstallCommands()};
+  });
+  window.AgentFlowSlidingTabs?.mount(platformTabs,{compact:true,cacheKey:'runner-install-platform'});
+}
+/** 同步系统选择、接入说明与命令，绑定码过期时禁止复制。 */
+function renderRunnerInstallCommands(){
+  runnerInstallPlatform=runnerInstallPlatform||'unix';
+  /** 当前选择的系统是否使用 PowerShell。 */
+  const windows=runnerInstallPlatform==='windows';
+  renderRunnerInstallTabs();
+  /** 绑定码有效状态，仅在本次渲染时用于显示。 */
+  const ready=runnerBindCodeReady();
+  /** 接入命令展示与复制控件。 */
+  const command=$('#bindCliCommand'),copyBtn=$('#copyBindCommand');
+  if(command){
+    command.textContent=ready?(windows?runnerWindowsCommand():runnerUnixCommand()):'绑定码尚未就绪或已过期，请刷新后复制接入命令。';
+    command.dataset.shell=windows?'powershell':'bash';
+  }
+  if(copyBtn){
+    copyBtn.disabled=!ready;
+    copyBtn.onclick=()=>{
+      // 页面可能停留到绑定码过期，点击时再校验一次。
+      if(!runnerBindCodeReady()){renderRunnerInstallCommands();toast('绑定码已过期，请刷新后重试');return}
+      runnerCopyCommand(copyBtn,runnerInstallPlatform==='windows'?runnerWindowsCommand():runnerUnixCommand(),'已复制，请在绑定码有效期内执行');
+    };
+  }
+  $('#runnerShellHint').textContent=windows?'在 Windows PowerShell 5.1 或 PowerShell 7 中执行':'在 macOS 或 Linux 的 Bash 终端中执行';
+  $('#runnerCLIInstallHint').textContent=windows?'安装原生 .exe，并在当前 Windows 账号下登录':'安装 CLI，并在当前系统账号下登录';
+  $('#runnerMaintenanceLabel').textContent=windows?'启动 / 停止机器（保留数据）':'卸载执行器';
+  $('#runnerRestartControls').hidden=!windows;
+  $('#runnerStopHint').hidden=!windows;
+  /** 已绑定机器的无绑定码启动命令。 */
+  const restartCommand=$('#runnerRestartCommand');
+  restartCommand.textContent=windows?runnerWindowsCommand('restart'):'';
+  $('#copyRunnerRestartCommand').onclick=()=>runnerCopyCommand($('#copyRunnerRestartCommand'),restartCommand.textContent,'已复制启动命令');
+  /** 与当前系统匹配的停止或卸载命令。 */
+  const maintenance=$('#runnerMaintenanceCommand');
+  maintenance.textContent=windows?runnerWindowsCommand('stop'):runnerUnixCommand(true);
+  maintenance.dataset.shell=windows?'powershell':'bash';
+  $('#copyUninstallCommand').onclick=()=>runnerCopyCommand($('#copyUninstallCommand'),maintenance.textContent,windows?'已复制停止命令':'已复制卸载命令');
+}
+/** 刷新接入说明和机器列表，保留用户选择的接入系统。 */
 function renderRunnersView(){
   const list=$('#runnersList');if(!list)return;
-  const host=location.host;
-  const httpsOrigin=`https://${host}`,httpOrigin=`http://${host}`;
-  const bindHTTPS=$('#bindHttpsOrigin'),bindHTTP=$('#bindHttpOrigin'),bindHost=$('#bindServerHost');
-  if(bindHTTPS)bindHTTPS.textContent=httpsOrigin;if(bindHTTP)bindHTTP.textContent=httpOrigin;if(bindHost)bindHost.textContent=host;
-  const tokenSpan=$('#bindToken');
-  if(tokenSpan)tokenSpan.textContent=state.runnerBindCode?.code||'生成中…';
-  const copyBtn=$('#copyBindCommand');
-  if(copyBtn)copyBtn.onclick=()=>{
-    const text=$('#bindCliCommand')?.innerText||'';
-    runnerCopyCommand(copyBtn,text,'已复制，10 分钟内有效');
-  };
-  const uninstallHTTPS=$('#uninstallHttpsOrigin'),uninstallHTTP=$('#uninstallHttpOrigin');
-  if(uninstallHTTPS)uninstallHTTPS.textContent=httpsOrigin;if(uninstallHTTP)uninstallHTTP.textContent=httpOrigin;
-  const copyUnBtn=$('#copyUninstallCommand');
-  if(copyUnBtn)copyUnBtn.onclick=(e)=>{
-    const text=e.currentTarget.parentElement?.querySelector('pre')?.innerText||'';
-    runnerCopyCommand(copyUnBtn,text,'已复制卸载命令');
-  };
+  renderRunnerInstallCommands();
   const runners=state.runners||[];
   const defaultId=state.defaultRunnerId||'';
   $('#runnerCount').textContent=String(runners.length);
@@ -132,7 +205,7 @@ function renderRunnersView(){
       const personalLabel=credentialReady?'个人凭证':'个人凭证（未配置）';
       const credentialMissing=authMode==='personal'&&!credentialReady;
       const authControl=rt.provider==='codebuddy'
-        ?`<span class="runner-auth-fixed ${credentialReady?'':'missing'}" title="CodeBuddy 使用个人配置中保存的 API Key">${personalLabel}</span>`
+        ?runnerCodeBuddyAuthHTML(credentialReady)
         :`<select class="runner-auth-select ${credentialMissing?'missing':''}" data-runner-auth="${escapeHTML(r.id)}|${escapeHTML(rt.provider)}" aria-label="${runnerCLILabels[rt.provider]} 认证来源"${credentialMissing?` title="到个人配置补充 ${runnerCLILabels[rt.provider]} API Key"`:''}>
             <option value="local" ${authMode==='local'?'selected':''}>本机登录</option>
             <option value="personal" ${authMode==='personal'?'selected':''}>${personalLabel}</option>
@@ -147,9 +220,10 @@ function renderRunnersView(){
     const cliSection=cliRows||'<div class="runner-runtime-empty">未发现支持的 Agent CLI</div>';
     const shared=!(Number(r.ownerUserId)>0);
     const osLabel=runnerOSLabels[r.os]||r.os||'?';
+    const defaultBlocker=isDefault?'':runnerDefaultBlocker(r);
     return `<article class="runner-card panel ${isDefault?'is-default':''}">
       <div class="runner-card-head">
-        <div class="runner-card-title"><div class="runner-card-name"><b title="${escapeHTML(r.id)}">${escapeHTML(r.name||r.id)}</b>${isDefault?'<span class="runner-tag default">默认</span>':''}${shared?'<span class="runner-tag">共享</span>':''}</div><small>${escapeHTML(osLabel)} · ${escapeHTML(r.arch||'?')} · ${runnerLastSeenHTML(r.lastSeenAt)}</small></div>
+        <div class="runner-card-title"><div class="runner-card-name"><b title="${escapeHTML(r.id)}">${escapeHTML(r.name||r.id)}</b>${isDefault?'<span class="runner-tag default">默认</span>':''}${shared?'<span class="runner-tag">共享</span>':''}</div><small>${escapeHTML(osLabel)} · ${escapeHTML(r.arch||'?')} · Runner ${escapeHTML(r.runnerVersion||'未知')} · ${runnerLastSeenHTML(r.lastSeenAt)}</small></div>
         ${runnerStatusLabel(r.status)}
       </div>
       <div class="runner-runtime-list">${cliSection}</div>
@@ -158,7 +232,7 @@ function renderRunnersView(){
         <span class="runner-card-spacer"></span>
         ${isDefault?'<button class="button ghost small runner-text-button" type="button" data-set-default="">切回云端</button>':''}
         ${r.status==='online'?'':`<button class="button ghost small runner-text-button" type="button" data-remove-runner="${escapeHTML(r.id)}" title="机器已不再使用时移除绑定">移除</button>`}
-        ${isDefault?'':`<button class="button hui-btn-soft small" type="button" ${r.status==='online'?'':'disabled title="机器离线"'} data-set-default="${escapeHTML(r.id)}">设为默认</button>`}
+        ${isDefault?'':`<button class="button hui-btn-soft small" type="button" ${defaultBlocker?`disabled title="${escapeHTML(defaultBlocker)}"`:''} data-set-default="${escapeHTML(r.id)}">设为默认</button>`}
       </div>
     </article>`;
   }).join('')||'<div class="runner-empty"><b>还没有机器</b><span>执行上方命令后自动出现</span></div>';
@@ -189,6 +263,22 @@ async function removeRunner(runnerId){
     await api(`/api/runners/${encodeURIComponent(runnerId)}`,{method:'DELETE'});
     toast('已移除','ok');refreshRunners(true);
   }catch(err){toast(err.message)}
+}
+// Mirrors domain.Runner.DefaultSelectionBlocker so the page and
+// PUT /api/runners/default refuse the same machines with the same reason.
+function runnerVersionAtLeast(have,want){
+  const parse=v=>{const parts=String(v||'').trim().replace(/^v/,'').split('.');return parts.every(p=>/^\d+$/.test(p))?parts.map(Number):null};
+  const h=parse(have),w=parse(want);
+  if(!w)return true;
+  if(!h)return false;
+  for(let i=0;i<w.length;i++){const hv=h[i]||0;if(hv!==w[i])return hv>w[i]}
+  return true;
+}
+function runnerDefaultBlocker(r){
+  if(r.status!=='online')return '机器离线';
+  const min=state.minRunnerVersion||'';
+  if(min&&!runnerVersionAtLeast(r.runnerVersion,min))return `执行机器版本 ${r.runnerVersion||'未知'} 过低，需升级至 ${min} 及以上`;
+  return '';
 }
 async function setDefaultRunner(runnerId){
   try{

@@ -27,9 +27,14 @@ func (s *localSandbox) Close(context.Context) error {
 	return nil
 }
 func (s *localSandbox) Exec(ctx context.Context, command CommandSpec, sink EventSink) (string, error) {
-	cmd, err := s.command(ctx, command, controlledBaseEnvironment(os.Environ()))
+	command, cleanup, err := PrepareHostShellCommand(command)
 	if err != nil {
 		return "", err
+	}
+	defer cleanup()
+	cmd, err := s.command(ctx, command, controlledBaseEnvironment(os.Environ()))
+	if err != nil {
+		return "", fmt.Errorf("%w: %w", errProcessNotStarted, err)
 	}
 	return runCommand(cmd, sink)
 }
@@ -52,6 +57,13 @@ func (s *localSandbox) command(ctx context.Context, command CommandSpec, base []
 	cmd.Env = upsertEnv(cmd.Env, "PWD", workspace)
 	cmd.Env = upsertEnv(cmd.Env, "GIT_CEILING_DIRECTORIES", filepath.Dir(workspace))
 	cmd.Stdin = command.Stdin
+	if command.WorkingDir != "" {
+		cmd.Dir = command.WorkingDir
+		cmd.Env = upsertEnv(cmd.Env, "PWD", command.WorkingDir)
+	}
+	if command.OwnProcessGroup {
+		configureOwnedProcessGroup(cmd)
+	}
 	return cmd, nil
 }
 
@@ -88,5 +100,10 @@ func ExecuteLocalCommand(ctx context.Context, workspace string, command CommandS
 	if err != nil {
 		return "", err
 	}
+	stopSSH, err := bindCommandGitSSH(sandbox, workspace, bound, credentials)
+	if err != nil {
+		return "", err
+	}
+	defer stopSSH()
 	return sandbox.Exec(ctx, bound, sink)
 }

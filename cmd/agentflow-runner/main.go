@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	goruntime "runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -32,10 +33,13 @@ func main() {
 	concurrency := flag.Int("concurrency", 1, "maximum concurrent tasks")
 	heartbeat := flag.Duration("heartbeat", 30*time.Second, "heartbeat interval")
 	longPoll := flag.Duration("long-poll", 35*time.Second, "client-side long-poll timeout; must exceed the server's")
-	autoUpdate := flag.Bool("auto-update", true, "check for platform updates before claiming queued work")
+	autoUpdate := flag.Bool("auto-update", goruntime.GOOS != "windows", "check for platform updates before claiming queued work (unavailable on Windows)")
 	labels := flag.String("labels", "", "comma-separated runner labels")
 	reuseSandbox := flag.Bool("reuse-run-sandbox", true, "run all nodes of a run in one sandbox per definition instead of one per task")
 	flag.Parse()
+	if goruntime.GOOS == "windows" && *autoUpdate {
+		log.Printf("automatic Runner updates are unavailable on Windows; stop the Runner before replacing its binaries")
+	}
 	loadDotEnv()
 
 	cfg := runner.Config{
@@ -51,18 +55,8 @@ func main() {
 		ManagedCLIRoot:         strings.TrimSpace(os.Getenv("AGENTFLOW_MANAGED_CLI_ROOT")),
 		DisableRunSandboxReuse: !*reuseSandbox,
 	}
-	if raw := strings.TrimSpace(os.Getenv("AGENTFLOW_RUNNER_CONCURRENCY")); raw != "" {
-		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
-			cfg.MaxConcurrency = parsed
-		}
-	}
-	if *labels != "" {
-		for _, label := range strings.Split(*labels, ",") {
-			if label = strings.TrimSpace(label); label != "" {
-				cfg.Labels = append(cfg.Labels, label)
-			}
-		}
-	}
+	cfg.MaxConcurrency = concurrencyFromEnv(cfg.MaxConcurrency)
+	cfg.Labels = parseLabels(*labels)
 
 	daemon, err := runner.New(cfg)
 	if err != nil {
@@ -78,13 +72,36 @@ func main() {
 			log.Fatal("locate updated runner: ", exeErr)
 		}
 		log.Printf("restarting updated runner")
-		if exeErr := syscall.Exec(binary, os.Args, os.Environ()); exeErr != nil {
+		if exeErr := restartRunner(binary); exeErr != nil {
 			log.Fatal("restart updated runner: ", exeErr)
 		}
 	} else if err != nil {
 		log.Fatal(err)
 	}
 	log.Printf("runner stopped")
+}
+
+// concurrencyFromEnv lets AGENTFLOW_RUNNER_CONCURRENCY override the flag value
+// when it holds a positive integer; anything else keeps fallback.
+func concurrencyFromEnv(fallback int) int {
+	if raw := strings.TrimSpace(os.Getenv("AGENTFLOW_RUNNER_CONCURRENCY")); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
+			return parsed
+		}
+	}
+	return fallback
+}
+
+// parseLabels splits the comma-separated -labels flag, trimming blanks and
+// dropping empty entries. It returns nil when no label remains.
+func parseLabels(raw string) []string {
+	var labels []string
+	for _, label := range strings.Split(raw, ",") {
+		if label = strings.TrimSpace(label); label != "" {
+			labels = append(labels, label)
+		}
+	}
+	return labels
 }
 
 func firstNonEmpty(values ...string) string {

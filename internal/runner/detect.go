@@ -88,6 +88,9 @@ func extraSearchPaths() []string {
 // lookupCLI resolves a binary name against PATH first, then the common
 // user-local installation directories.
 func lookupCLI(binary string) (string, bool) {
+	if goruntime.GOOS == "windows" {
+		return lookupWindowsCLI(binary)
+	}
 	if path, err := exec.LookPath(binary); err == nil && strings.TrimSpace(path) != "" {
 		return path, true
 	}
@@ -100,6 +103,48 @@ func lookupCLI(binary string) (string, bool) {
 	return "", false
 }
 
+// lookupWindowsCLI searches for the exact native executable. PATHEXT may
+// prefer npm batch shims, which cannot be spawned directly by the runner.
+func lookupWindowsCLI(binary string) (string, bool) {
+	if binary == "" {
+		return "", false
+	}
+	switch strings.ToLower(filepath.Ext(binary)) {
+	case "":
+		binary += ".exe"
+	case ".exe":
+	default:
+		return "", false
+	}
+	if strings.ContainsAny(binary, "/\\:") {
+		path, err := filepath.Abs(binary)
+		if err != nil {
+			return "", false
+		}
+		if isWindowsCLIFile(path) {
+			return path, true
+		}
+		return "", false
+	}
+	dirs := append(filepath.SplitList(os.Getenv("PATH")), extraSearchPaths()...)
+	for _, dir := range dirs {
+		// Implicit relative paths could resolve inside the daemon directory.
+		if !filepath.IsAbs(dir) {
+			continue
+		}
+		candidate := filepath.Join(dir, binary)
+		if isWindowsCLIFile(candidate) {
+			return candidate, true
+		}
+	}
+	return "", false
+}
+
+func isWindowsCLIFile(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.Mode().IsRegular()
+}
+
 // DetectRuntimes scans PATH for the known Agent CLIs and records their
 // versions. A missing CLI is simply absent from the report; it is not an
 // error, and the platform will not dispatch that provider to this machine.
@@ -108,38 +153,9 @@ func DetectRuntimes(ctx context.Context, extraBinaries map[string]string) []doma
 }
 
 func detectRuntimes(ctx context.Context, extraBinaries map[string]string, inventory managedcli.Inventory) []domain.RunnerRuntime {
-	specs := make([]providerSpec, 0, len(defaultProviders)+len(extraBinaries)+1)
-	seen := map[string]bool{}
-	for _, spec := range defaultProviders {
-		specs = append(specs, spec)
-		seen[spec.Kind] = true
-	}
-	kinds := make([]string, 0, len(extraBinaries))
-	for kind := range extraBinaries {
-		kinds = append(kinds, kind)
-	}
-	sort.Strings(kinds)
-	for _, kind := range kinds {
-		if !seen[kind] {
-			specs = append(specs, providerSpec{Kind: kind, Binary: extraBinaries[kind]})
-			seen[kind] = true
-		}
-	}
+	specs := runtimeProviderSpecs(extraBinaries)
 	out := make([]domain.RunnerRuntime, 0, len(specs)+2)
-	out = append(out, domain.RunnerRuntime{
-		Provider:     mockProviderKind,
-		BinaryPath:   "(builtin)",
-		Capabilities: []string{"non_interactive"},
-		Status:       domain.RuntimeStatusOnline,
-	})
-	// The terminal capability lets the platform run verification gates and
-	// sandbox-side commands on this machine.
-	out = append(out, domain.RunnerRuntime{
-		Provider:     terminalProviderKind,
-		BinaryPath:   "(builtin)",
-		Capabilities: []string{"terminal"},
-		Status:       domain.RuntimeStatusOnline,
-	})
+	out = append(out, builtinRuntimes()...)
 	for _, spec := range specs {
 		binary, managed := inventory.BinaryFor(spec.Kind)
 		if !managed {
@@ -169,6 +185,52 @@ func detectRuntimes(ctx context.Context, extraBinaries map[string]string, invent
 		})
 	}
 	return out
+}
+
+// runtimeProviderSpecs returns the CLIs to probe: every default provider in
+// declaration order, followed by extra kinds configured only through
+// extraBinaries in sorted order. An extra binary for a default kind does not
+// add a second spec; detectRuntimes applies it as an explicit override.
+func runtimeProviderSpecs(extraBinaries map[string]string) []providerSpec {
+	specs := make([]providerSpec, 0, len(defaultProviders)+len(extraBinaries))
+	seen := make(map[string]bool, len(defaultProviders)+len(extraBinaries))
+	for _, spec := range defaultProviders {
+		specs = append(specs, spec)
+		seen[spec.Kind] = true
+	}
+	kinds := make([]string, 0, len(extraBinaries))
+	for kind := range extraBinaries {
+		kinds = append(kinds, kind)
+	}
+	sort.Strings(kinds)
+	for _, kind := range kinds {
+		if !seen[kind] {
+			specs = append(specs, providerSpec{Kind: kind, Binary: extraBinaries[kind]})
+			seen[kind] = true
+		}
+	}
+	return specs
+}
+
+// builtinRuntimes returns the in-process runtimes every runner reports
+// regardless of installed CLIs: the mock provider and the terminal
+// capability, which lets the platform run verification gates and
+// sandbox-side commands on this machine.
+func builtinRuntimes() []domain.RunnerRuntime {
+	return []domain.RunnerRuntime{
+		{
+			Provider:     mockProviderKind,
+			BinaryPath:   "(builtin)",
+			Capabilities: []string{"non_interactive"},
+			Status:       domain.RuntimeStatusOnline,
+		},
+		{
+			Provider:     terminalProviderKind,
+			BinaryPath:   "(builtin)",
+			Capabilities: []string{"terminal"},
+			Status:       domain.RuntimeStatusOnline,
+		},
+	}
 }
 
 func probeVersion(ctx context.Context, path string, flags []string, environments ...map[string]string) string {

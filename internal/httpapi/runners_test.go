@@ -186,7 +186,7 @@ func TestRunnerDeregisterRemovesMachineAndSelections(t *testing.T) {
 		t.Fatalf("bind code response: %s", rec.Body.String())
 	}
 	rec = requestWithHeaders(t, h, http.MethodPost, "/api/runners/register", map[string]any{
-		"name": "dereg-mac", "os": "darwin", "arch": "arm64", "maxConcurrency": 1,
+		"name": "dereg-mac", "os": "darwin", "arch": "arm64", "version": domain.RunnerVersionDefaultSelection, "maxConcurrency": 1,
 	}, map[string]string{"X-Bootstrap-Token": issued.Code})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("register: %d %s", rec.Code, rec.Body.String())
@@ -659,6 +659,7 @@ func TestRunnerTaskClaimFindsTaskInsertedByAnotherProcess(t *testing.T) {
 func TestIsRunnerAgentPath(t *testing.T) {
 	agentPaths := []string{
 		"/runners/install.sh",
+		"/runners/install.ps1",
 		"/runners/agentflow-runner",
 		"/runners/agentflow-gate-mcp",
 		"/runners/health",
@@ -722,7 +723,7 @@ func TestRunnerMachinePlaneNeedsNoUserIdentityButKeepsRunnerAuth(t *testing.T) {
 	e := engine.New(s, runtime.NewManager(filepath.Join(root, "workspaces")))
 	h := New(s, e, tracker.NewService(), "preview", "secret")
 
-	for _, path := range []string{"/runners/install.sh", "/runners/health", "/runners/agentflow-runner?os=linux&arch=amd64", "/runners/agentflow-gate-mcp?os=linux&arch=amd64"} {
+	for _, path := range []string{"/runners/install.sh", "/runners/install.ps1", "/runners/health", "/runners/agentflow-runner?os=linux&arch=amd64", "/runners/agentflow-gate-mcp?os=linux&arch=amd64"} {
 		rec := requestWithHeaders(t, h, http.MethodGet, path, nil, nil)
 		if rec.Code != http.StatusOK {
 			t.Fatalf("public machine asset %s: status=%d body=%s", path, rec.Code, rec.Body.String())
