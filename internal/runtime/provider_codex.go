@@ -196,6 +196,9 @@ func codexMCPServerArgs(m domain.MCPServerDefinition) []string {
 		args = append(args, "-c", fmt.Sprintf("%stool_timeout_sec=%d.0", prefix, m.TimeoutSec))
 	}
 	// Under approval_policy=never Codex rejects MCP calls that need approval.
-	args = append(args, "-c", prefix+`default_tools_approval_mode="approve"`)
+	// Only the platform gate is auto-approved; other servers keep Codex defaults.
+	if m.ID == gateMCPServerID {
+		args = append(args, "-c", prefix+`default_tools_approval_mode="approve"`)
+	}
 	return args
 }
